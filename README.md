@@ -4,4 +4,10 @@
 
 使用方式：
 
-curl https://raw.githubusercontent.com/xwqiang/http_source/main/a.txt
+1. 编辑文本： 
+
+`https://github.com/xwqiang/http_source/edit/main/a.txt`
+
+2. 使用文本：
+
+`curl https://raw.githubusercontent.com/xwqiang/http_source/main/a.txt`

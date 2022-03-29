@@ -1,1 +1,112 @@
-test
+# -*- coding: utf-8 -*-
+from typing import Any, Optional
+import gzip
+import logging
+
+from proxy.http.proxy import HttpProxyBasePlugin
+from proxy.http.parser import HttpParser, httpParserTypes
+from env_config import EnvConfig
+from proxy.common.constants import SLASH
+
+br_installed = False
+try:
+    import brotli
+
+    br_installed = True
+except ModuleNotFoundError:
+    pass
+logger = logging.getLogger(__name__)
+
+
+class ScrawlBuyinPlugin(HttpProxyBasePlugin):
+    """Accumulate & modify chunk responses as received from upstream."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.env_config = EnvConfig()  # singleton
+        self.response = None
+        self.request = None
+        self.request_host = None  # str
+        self.request_path = None  # str
+        self.cookie_dict = None
+
+    def before_upstream_connection(
+            self, request: HttpParser,
+    ) -> Optional[HttpParser]:
+        self.request = request
+        return request
+
+    def handle_upstream_chunk(self, chunk: memoryview) -> Optional[memoryview]:
+        self.request_path = SLASH if not self.request.path else self.request.path
+        self.request_host = self.determinehost(self.request)
+
+        logger.info('host %s, path %s', self.request_host, self.request_path)
+        if not self.need_to_transmit():
+            return chunk
+
+        self.cookie_dict = dict(k.split('=', 1) for k in self.request.header('cookie').strip(';').split(';'))
+        # Note that these chunks also include headers
+        self.response = HttpParser(httpParserTypes.RESPONSE_PARSER)
+        self.response.parse(chunk)
+
+        if self.response.is_complete:
+
+            # otherwise queue the original response to client
+            if self.response.is_chunked_encoded and self.response.body_expected and self.response.body:
+                body = self.response.body
+                if self.response.has_header(b'content-encoding'):
+                    encoding = self.response.header(b'content-encoding')
+                    if encoding == b'gzip':
+                        body = gzip.decompress(body)
+                    elif encoding == b'br' and br_installed:
+                        body = brotli.decompress(body)
+                    else:
+                        logger.warning('Unsupported content encoding %s', encoding)
+                        return chunk
+
+                data = self.construct_data(self.request_path, body)
+                resp = self.env_config.session.post(self.env_config.report_url, json=data, timeout=(5, 5))
+                logger.info("report data :%s resp %s", self.request_path, resp.text)
+        return chunk
+
+    @staticmethod
+    def determinehost(request: HttpParser) -> str:
+        if request.host:
+            return request.host
+        elif request.headers and b'host' in request.headers:
+            return request.header(b'host')
+        return None
+
+    def need_to_transmit(self) -> bool:
+        return self.request_path and self.get_path() in self.env_config.apis
+
+    def construct_data(self, request_path: str, data: str):
+        """
+        构建上报数据结构
+        """
+        room_id = self.cookie_dict.get(self.env_config.room_id_session_key)
+        if not room_id:
+            return
+
+        return {
+            "awemeId": self.cookie_dict.get(self.env_config.aweme_id_session_key),
+            "roomId": room_id,
+            "api": self.get_path(),
+            "target": self.handle_core_data(request_path),
+            "data": data,
+        }
+
+    def get_path(self):
+        return self.request_path[0: self.request_path.rindex(b'?')] if b'?' in self.request_path else self.request_path,
+
+    def handle_core_data(self, request_path):
+        """
+        大盘数据中，分两个标签来抓取，第一个标签选择了"成交人数",另外一个没有
+        """
+        if self.env_config.core_data_uri != self.get_path(request_path):
+            return "mitm-proxy:" + self.env_config.hostname
+
+        if ",pay_ucnt," in request_path:
+            return self.env_config.core_data1
+        else:
+            return self.env_config.core_data2

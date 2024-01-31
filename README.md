@@ -14,6 +14,8 @@
 
 3. 上传文件：
 
+> sh ./github.sh `cat hl.png|base64` a.png
+
 ```
 #!/bin/sh
 content="$1"
